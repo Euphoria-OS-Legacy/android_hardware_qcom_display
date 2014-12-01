@@ -198,7 +198,6 @@ static void setWfdStatus(hwc_context_t *ctx, uint32_t wfdStatus) {
     }
 }
 
-
 static status_t setViewFrame(hwc_context_t* ctx, const Parcel* inParcel) {
     int dpy = inParcel->readInt32();
     if(dpy >= HWC_DISPLAY_PRIMARY && dpy <= HWC_DISPLAY_VIRTUAL) {
@@ -264,6 +263,9 @@ status_t QClient::notifyCallback(uint32_t command, const Parcel* inParcel,
             break;
         case IQService::SET_VIEW_FRAME:
             setViewFrame(mHwcContext, inParcel);
+            break;
+        case IQService::SET_PTOR_MODE:
+            mHwcContext->mIsPTOREnabled = inParcel->readInt32();
             break;
         default:
             ret = NO_ERROR;

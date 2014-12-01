@@ -39,6 +39,8 @@
 #define MAX_NUM_APP_LAYERS 32
 #define HWC_WFDDISPSYNC_LOG 0
 #define STR(f) #f;
+// Max number of PTOR layers handled
+#define MAX_PTOR_LAYERS 2
 
 //Fwrd decls
 struct hwc_context_t;
@@ -63,6 +65,7 @@ class CopyBit;
 class HwcDebug;
 class AssertiveDisplay;
 class VPUClient;
+class HWCVirtualBase;
 
 
 struct MDPInfo {
@@ -78,6 +81,7 @@ struct DisplayAttributes {
     uint32_t stride;
     float xdpi;
     float ydpi;
+    bool secure;
     int fd;
     bool connected; //Applies only to pluggable disp.
     //Connected does not mean it ready to use.
@@ -117,6 +121,22 @@ struct ListStats {
     ovutils::Dim roi;
     bool secureUI; // Secure display layer
     bool isSecurePresent;
+};
+
+//PTOR Comp info
+struct PtorInfo {
+    int count;
+    int layerIndex[MAX_PTOR_LAYERS];
+    hwc_rect_t displayFrame[MAX_PTOR_LAYERS];
+    bool isActive() { return (count>0); }
+    int getPTORArrayIndex(int index) {
+        int idx = -1;
+        for(int i = 0; i < count; i++) {
+            if(index == layerIndex[i])
+                idx = i;
+        }
+        return idx;
+    }
 };
 
 struct LayerProp {
@@ -234,6 +254,9 @@ void sanitizeSourceCrop(hwc_rect_t& cropL, hwc_rect_t& cropR,
 bool isAlphaPresent(hwc_layer_1_t const* layer);
 int hwc_vsync_control(hwc_context_t* ctx, int dpy, int enable);
 int getBlending(int blending);
+bool isGLESOnlyComp(hwc_context_t *ctx, const int& dpy);
+void reset_layer_prop(hwc_context_t* ctx, int dpy, int numAppLayers);
+void dumpBuffer(private_handle_t *ohnd, char *bufferName);
 
 //Helper function to dump logs
 void dumpsys_log(android::String8& buf, const char* fmt, ...);
@@ -310,7 +333,7 @@ int configColorLayer(hwc_context_t *ctx, hwc_layer_1_t *layer, const int& dpy,
         ovutils::eIsFg& isFg, const ovutils::eDest& dest);
 
 void updateSource(ovutils::eTransform& orient, ovutils::Whf& whf,
-        hwc_rect_t& crop);
+        hwc_rect_t& crop, overlay::Rotator *rot);
 
 //Routine to configure low resolution panels (<= 2048 width)
 int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer, const int& dpy,
@@ -349,6 +372,9 @@ bool isDisplaySplit(hwc_context_t* ctx, int dpy);
 // due to idle fallback or MDP composition.
 void setGPUHint(hwc_context_t* ctx, hwc_display_contents_1_t* list);
 
+// Returns true if rect1 is peripheral to rect2, false otherwise.
+bool isPeripheral(const hwc_rect_t& rect1, const hwc_rect_t& rect2);
+
 // Inline utility functions
 static inline bool isSkipLayer(const hwc_layer_1_t* l) {
     return (UNLIKELY(l && (l->flags & HWC_SKIP_LAYER)));
@@ -369,6 +395,12 @@ static inline bool is4kx2kYuvBuffer(const private_handle_t* hnd) {
 static inline bool isSecureBuffer(const private_handle_t* hnd) {
     return (hnd && (private_handle_t::PRIV_FLAGS_SECURE_BUFFER & hnd->flags));
 }
+
+// Returns true if the buffer is protected
+static inline bool isProtectedBuffer(const private_handle_t* hnd) {
+    return (hnd && (private_handle_t::PRIV_FLAGS_PROTECTED_BUFFER & hnd->flags));
+}
+
 //Return true if buffer is marked locked
 static inline bool isBufferLocked(const private_handle_t* hnd) {
     return (hnd && (private_handle_t::PRIV_FLAGS_HWC_LOCK & hnd->flags));
@@ -487,6 +519,7 @@ struct hwc_context_t {
     qhwc::AssertiveDisplay *mAD;
     qhwc::VPUClient *mVPUClient;
     eAnimationState mAnimationState[HWC_NUM_DISPLAY_TYPES];
+    qhwc::HWCVirtualBase *mHWCVirtual;
 
     // stores the #numHwLayers of the previous frame
     // for each display device
@@ -523,7 +556,15 @@ struct hwc_context_t {
     bool mMDPDownscaleEnabled;
     // number of active Displays
     int numActiveDisplays;
+
+    // Is WFD enabled through VDS solution ?
+    // This can be set via system property
+    // persist.hwc.enable_vds
+    bool mVDSEnabled;
     struct gpu_hint_info mGPUHintInfo;
+    // PTOR Info
+    qhwc::PtorInfo mPtorInfo;
+    uint32_t mIsPTOREnabled;
 };
 
 namespace qhwc {
@@ -547,6 +588,11 @@ inline bool isSecurePresent(hwc_context_t *ctx, int dpy) {
 static inline bool isSecondaryConnected(hwc_context_t* ctx) {
     return (ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].connected ||
     ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].connected);
+}
+
+static inline bool isSecondaryConfiguring(hwc_context_t* ctx) {
+    return (ctx->dpyAttr[HWC_DISPLAY_EXTERNAL].isConfiguring ||
+            ctx->dpyAttr[HWC_DISPLAY_VIRTUAL].isConfiguring);
 }
 
 };

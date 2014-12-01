@@ -96,8 +96,7 @@ bool FBUpdateNonSplit::preRotateExtDisplay(hwc_context_t *ctx,
             mRot = NULL;
             return false;
         }
-        info.format = (mRot)->getDstFormat();
-        updateSource(orient, info, sourceCrop);
+        updateSource(orient, info, sourceCrop, mRot);
         rotFlags |= ovutils::ROT_PREROTATED;
     }
     return true;
@@ -138,7 +137,8 @@ bool FBUpdateNonSplit::configure(hwc_context_t *ctx, hwc_display_contents_1 *lis
             //For 8x26 external always use DMA pipe
             type = ovutils::OV_MDP_PIPE_DMA;
         }
-        ovutils::eDest dest = ov.nextPipe(type, mDpy, Overlay::MIXER_DEFAULT);
+        ovutils::eDest dest = ov.nextPipe(type, mDpy, Overlay::MIXER_DEFAULT,
+                                          Overlay::FORMAT_RGB);
         if(dest == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d",
                 __FUNCTION__, mDpy);
@@ -153,6 +153,8 @@ bool FBUpdateNonSplit::configure(hwc_context_t *ctx, hwc_display_contents_1 *lis
 
         ovutils::eMdpFlags mdpFlags = ovutils::OV_MDP_BLEND_FG_PREMULT;
         ovutils::eIsFg isFg = ovutils::IS_FG_OFF;
+        ovutils::setMdpFlags(mdpFlags,
+                ovutils::OV_MDP_SMP_FORCE_ALLOC);
         ovutils::eZorder zOrder = static_cast<ovutils::eZorder>(fbZorder);
 
         hwc_rect_t sourceCrop = integerizeSourceCrop(layer->sourceCropf);
@@ -280,7 +282,7 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
 
         //Request left pipe
         ovutils::eDest destL = ov.nextPipe(ovutils::OV_MDP_PIPE_ANY, mDpy,
-                Overlay::MIXER_LEFT);
+                Overlay::MIXER_LEFT, Overlay::FORMAT_RGB);
         if(destL == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d's left"
                     " mixer", __FUNCTION__, mDpy);
@@ -288,7 +290,7 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
         }
         //Request right pipe
         ovutils::eDest destR = ov.nextPipe(ovutils::OV_MDP_PIPE_ANY, mDpy,
-                Overlay::MIXER_RIGHT);
+                Overlay::MIXER_RIGHT, Overlay::FORMAT_RGB);
         if(destR == ovutils::OV_INVALID) { //None available
             ALOGE("%s: No pipes available to configure fb for dpy %d's right"
                     " mixer", __FUNCTION__, mDpy);
@@ -299,7 +301,8 @@ bool FBUpdateSplit::configure(hwc_context_t *ctx,
         mDestRight = destR;
 
         ovutils::eMdpFlags mdpFlagsL = ovutils::OV_MDP_BLEND_FG_PREMULT;
-
+        ovutils::setMdpFlags(mdpFlagsL,
+                ovutils::OV_MDP_SMP_FORCE_ALLOC);
         ovutils::eZorder zOrder = static_cast<ovutils::eZorder>(fbZorder);
 
         //XXX: FB layer plane alpha is currently sent as zero from

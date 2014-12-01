@@ -44,6 +44,7 @@
 #include "QService.h"
 #include "comptype.h"
 #include "qd_utils.h"
+#include "hwc_virtual.h"
 
 using namespace qClient;
 using namespace qService;
@@ -136,6 +137,7 @@ static int openFramebufferDevice(hwc_context_t *ctx)
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].xdpi = xdpi;
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].ydpi = ydpi;
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].vsync_period = 1000000000l / fps;
+    ctx->dpyAttr[HWC_DISPLAY_PRIMARY].secure = true;
 
     //Unblank primary on first boot
     if(ioctl(fb_fd, FBIOBLANK,FB_BLANK_UNBLANK) < 0) {
@@ -193,6 +195,14 @@ void initContext(hwc_context_t *ctx)
          MDPComp::getObject(ctx, HWC_DISPLAY_PRIMARY);
     ctx->dpyAttr[HWC_DISPLAY_PRIMARY].connected = true;
 
+    ctx->mVDSEnabled = false;
+    if((property_get("persist.hwc.enable_vds", value, NULL) > 0)) {
+        if(atoi(value) != 0) {
+            ctx->mVDSEnabled = true;
+        }
+    }
+    ctx->mHWCVirtual = HWCVirtualBase::getObject(ctx->mVDSEnabled);
+
     for (uint32_t i = 0; i < HWC_NUM_DISPLAY_TYPES; i++) {
         ctx->mHwcDebug[i] = new HwcDebug(i);
         ctx->mLayerRotMap[i] = new LayerRotMap();
@@ -246,7 +256,7 @@ void initContext(hwc_context_t *ctx)
     ctx->mGPUHintInfo.mEGLContext = NULL;
     ctx->mGPUHintInfo.mPrevCompositionGLES = false;
     ctx->mGPUHintInfo.mCurrGPUPerfMode = EGL_GPU_LEVEL_0;
-
+    memset(&(ctx->mPtorInfo), 0, sizeof(ctx->mPtorInfo));
     ALOGI("Initializing Qualcomm Hardware Composer");
     ALOGI("MDP version: %d", ctx->mMDP.version);
 }
@@ -303,6 +313,10 @@ void closeContext(hwc_context_t *ctx)
             delete ctx->mLayerRotMap[i];
             ctx->mLayerRotMap[i] = NULL;
         }
+    }
+    if(ctx->mHWCVirtual) {
+        delete ctx->mHWCVirtual;
+        ctx->mHWCVirtual = NULL;
     }
     if(ctx->mAD) {
         delete ctx->mAD;
@@ -1102,7 +1116,8 @@ void optimizeLayerRects(hwc_context_t *ctx,
 
         //see if there is no blending required.
         //If it is opaque see if we can substract this region from below layers.
-        if(list->hwLayers[i].blending == HWC_BLENDING_NONE) {
+        if(list->hwLayers[i].blending == HWC_BLENDING_NONE &&
+                list->hwLayers[i].planeAlpha == 0xFF) {
             int j= i-1;
             hwc_rect_t& topframe =
                 (hwc_rect_t&)list->hwLayers[i].displayFrame;
@@ -1166,12 +1181,19 @@ bool isExternalActive(hwc_context_t* ctx) {
 }
 
 void closeAcquireFds(hwc_display_contents_1_t* list) {
-    for(uint32_t i = 0; list && i < list->numHwLayers; i++) {
-        //Close the acquireFenceFds
-        //HWC_FRAMEBUFFER are -1 already by SF, rest we close.
-        if(list->hwLayers[i].acquireFenceFd >= 0) {
-            close(list->hwLayers[i].acquireFenceFd);
-            list->hwLayers[i].acquireFenceFd = -1;
+    if(LIKELY(list)) {
+        for(uint32_t i = 0; i < list->numHwLayers; i++) {
+            //Close the acquireFenceFds
+            //HWC_FRAMEBUFFER are -1 already by SF, rest we close.
+            if(list->hwLayers[i].acquireFenceFd >= 0) {
+                close(list->hwLayers[i].acquireFenceFd);
+                list->hwLayers[i].acquireFenceFd = -1;
+            }
+        }
+        //Writeback
+        if(list->outbufAcquireFenceFd >= 0) {
+            close(list->outbufAcquireFenceFd);
+            list->outbufAcquireFenceFd = -1;
         }
     }
 }
@@ -1237,7 +1259,12 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         }
     }
 
-    //Accumulate acquireFenceFds for MDP Overlays
+    //Accumulate acquireFenceFds for MDP
+    if(list->outbufAcquireFenceFd >= 0) {
+        //Writeback output buffer
+        acquireFd[count++] = list->outbufAcquireFenceFd;
+    }
+
     for(uint32_t i = 0; i < list->numHwLayers; i++) {
         if(list->hwLayers[i].compositionType == HWC_OVERLAY &&
                         list->hwLayers[i].acquireFenceFd >= 0) {
@@ -1258,6 +1285,11 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
             } else if(list->hwLayers[i].acquireFenceFd >= 0)
                 acquireFd[count++] = list->hwLayers[i].acquireFenceFd;
         }
+    }
+
+    if ((fd >= 0) && !dpy && ctx->mPtorInfo.isActive()) {
+        // Acquire c2d fence of Overlap render buffer
+        acquireFd[count++] = fd;
     }
 
     data.acq_fen_fd_cnt = count;
@@ -1308,8 +1340,12 @@ int hwc_sync(hwc_context_t *ctx, hwc_display_contents_1_t* list, int dpy,
         fd = -1;
     }
 
-    if (ctx->mCopyBit[dpy])
-        ctx->mCopyBit[dpy]->setReleaseFd(releaseFd);
+    if (ctx->mCopyBit[dpy]) {
+        if (!dpy && ctx->mPtorInfo.isActive())
+            ctx->mCopyBit[dpy]->setReleaseFdSync(releaseFd);
+        else
+            ctx->mCopyBit[dpy]->setReleaseFd(releaseFd);
+    }
 
     //Signals when MDP finishes reading rotator buffers.
     ctx->mLayerRotMap[dpy]->setReleaseFd(releaseFd);
@@ -1358,6 +1394,13 @@ void setMdpFlags(hwc_layer_1_t *layer,
                              ovutils::OV_MDP_SECURE_OVERLAY_SESSION);
         ovutils::setMdpFlags(mdpFlags,
                              ovutils::OV_MDP_SECURE_DISPLAY_OVERLAY_SESSION);
+        ovutils::setMdpFlags(mdpFlags,
+                ovutils::OV_MDP_SMP_FORCE_ALLOC);
+    }
+
+    if(isProtectedBuffer(hnd)) {
+        ovutils::setMdpFlags(mdpFlags,
+                ovutils::OV_MDP_SMP_FORCE_ALLOC);
     }
     //No 90 component and no rot-downscale then flips done by MDP
     //If we use rot then it might as well do flips
@@ -1393,18 +1436,8 @@ int configRotator(Rotator *rot, Whf& whf,
 
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-        uint32_t crop_w = (crop.right - crop.left);
-        uint32_t crop_h = (crop.bottom - crop.top);
-        if (ovutils::isYuv(whf.format)) {
-            ovutils::normalizeCrop((uint32_t&)crop.left, crop_w);
-            ovutils::normalizeCrop((uint32_t&)crop.top, crop_h);
-            // For interlaced, crop.h should be 4-aligned
-            if ((mdpFlags & ovutils::OV_MDP_DEINTERLACE) && (crop_h % 4))
-                crop_h = ovutils::aligndown(crop_h, 4);
-            crop.right = crop.left + crop_w;
-            crop.bottom = crop.top + crop_h;
-        }
-        Dim rotCrop(crop.left, crop.top, crop_w, crop_h);
+         Dim rotCrop(crop.left, crop.top, crop.right - crop.left,
+                crop.bottom - crop.top);
         rot->setCrop(rotCrop);
     }
 
@@ -1479,28 +1512,27 @@ int configColorLayer(hwc_context_t *ctx, hwc_layer_1_t *layer,
 }
 
 void updateSource(eTransform& orient, Whf& whf,
-        hwc_rect_t& crop) {
-    Dim srcCrop(crop.left, crop.top,
+        hwc_rect_t& crop, Rotator *rot) {
+    Dim transformedCrop(crop.left, crop.top,
             crop.right - crop.left,
             crop.bottom - crop.top);
-    orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
-    preRotateSource(orient, whf, srcCrop);
     if (qdutils::MDPVersion::getInstance().getMDPVersion() >=
         qdutils::MDSS_V5) {
-        // Source for overlay will be the cropped (and rotated)
-        crop.left = 0;
-        crop.top = 0;
-        crop.right = srcCrop.w;
-        crop.bottom = srcCrop.h;
-        // Set width & height equal to sourceCrop w & h
-        whf.w = srcCrop.w;
-        whf.h = srcCrop.h;
+        //B-family rotator internally could modify destination dimensions if
+        //downscaling is supported
+        whf = rot->getDstWhf();
+        transformedCrop = rot->getDstDimensions();
     } else {
-        crop.left = srcCrop.x;
-        crop.top = srcCrop.y;
-        crop.right = srcCrop.x + srcCrop.w;
-        crop.bottom = srcCrop.y + srcCrop.h;
+        //A-family rotator rotates entire buffer irrespective of crop, forcing
+        //us to recompute the crop based on transform
+        orient = static_cast<eTransform>(ovutils::getMdpOrient(orient));
+        preRotateSource(orient, whf, transformedCrop);
     }
+
+    crop.left = transformedCrop.x;
+    crop.top = transformedCrop.y;
+    crop.right = transformedCrop.x + transformedCrop.w;
+    crop.bottom = transformedCrop.y + transformedCrop.h;
 }
 
 int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
@@ -1565,8 +1597,7 @@ int configureNonSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ovutils::ROT_PREROTATED;
     }
 
@@ -1672,8 +1703,7 @@ int configureSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -1807,8 +1837,7 @@ int configureSourceSplit(hwc_context_t *ctx, hwc_layer_1_t *layer,
             ALOGE("%s: configRotator failed!", __FUNCTION__);
             return -1;
         }
-        whf.format = (*rot)->getDstFormat();
-        updateSource(orient, whf, crop);
+        updateSource(orient, whf, crop, *rot);
         rotFlags |= ROT_PREROTATED;
     }
 
@@ -1925,6 +1954,24 @@ bool isDisplaySplit(hwc_context_t* ctx, int dpy) {
     return false;
 }
 
+void dumpBuffer(private_handle_t *ohnd, char *bufferName) {
+    if (ohnd != NULL && ohnd->base) {
+        char dumpFilename[PATH_MAX];
+        bool bResult = false;
+        snprintf(dumpFilename, sizeof(dumpFilename), "/data/%s.%s.%dx%d.raw",
+            bufferName,
+            overlay::utils::getFormatString(utils::getMdpFormat(ohnd->format)),
+            getWidth(ohnd), getHeight(ohnd));
+        FILE* fp = fopen(dumpFilename, "w+");
+        if (NULL != fp) {
+            bResult = (bool) fwrite((void*)ohnd->base, ohnd->size, 1, fp);
+            fclose(fp);
+        }
+        ALOGD("Buffer[%s] Dump to %s: %s",
+        bufferName, dumpFilename, bResult ? "Success" : "Fail");
+    }
+}
+
 bool isGLESComp(hwc_context_t *ctx,
                      hwc_display_contents_1_t* list) {
     int numAppLayers = ctx->listStats[HWC_DISPLAY_PRIMARY].numAppLayers;
@@ -1995,6 +2042,29 @@ void setGPUHint(hwc_context_t* ctx, hwc_display_contents_1_t* list) {
         }
         gpuHint->mPrevCompositionGLES = false;
     }
+}
+
+bool isPeripheral(const hwc_rect_t& rect1, const hwc_rect_t& rect2) {
+    // To be peripheral, 3 boundaries should match.
+   uint8_t eqBounds = 0;
+    if (rect1.left == rect2.left)
+        eqBounds++;
+    if (rect1.top == rect2.top)
+       eqBounds++;
+    if (rect1.right == rect2.right)
+        eqBounds++;
+    if (rect1.bottom == rect2.bottom)
+        eqBounds++;
+    return (eqBounds == 3);
+}
+
+//clear prev layer prop flags and realloc for current frame
+void reset_layer_prop(hwc_context_t* ctx, int dpy, int numAppLayers) {
+    if(ctx->layerProp[dpy]) {
+       delete[] ctx->layerProp[dpy];
+       ctx->layerProp[dpy] = NULL;
+    }
+    ctx->layerProp[dpy] = new LayerProp[numAppLayers];
 }
 
 void BwcPM::setBwc(hwc_context_t *ctx, const hwc_rect_t& crop,
